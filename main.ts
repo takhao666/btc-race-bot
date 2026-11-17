@@ -1,72 +1,44 @@
-// Trend rider bot for btc-race-24h-20261117-0603 (own design, v2).
+// Trend rider bot for btc-race-24h-20261117-0603 (own design, v4).
 //
-// Lesson from the dev window: it is nearly flat (+0.2% drift over 24h)
-// and every trade costs ~6 bps + impact, so all churning strategies lose
-// and the only positive baselines are the ones that buy once and hold.
-// This bot therefore behaves like buy-and-hold when the trend is up, but
-// unlike buy-and-hold it steps aside when the trend turns down, and it
-// can re-enter if the trend turns back up. It trades a handful of times
-// per day at most.
+// Lesson from the dev window: it is nearly flat (+0.5% drift over 24h)
+// and every trade costs ~26 bps in fees/slippage/impact, so all churning
+// strategies lose and the only positive baselines are the ones that buy
+// once and hold. v2 churned: its fast/slow EMA cross-down exit fired 7
+// times, each exit followed by a re-entry (-$31.63, 14 trades, 0 wins).
+// v3 dropped the exit and passed the dev gate (+$0.68, 1 trade), but its
+// EMA entry filter delayed the buy 72 bars and left the margin thin.
+// v4 therefore drops the EMA filter too: enter on the first positive
+// trailing return, then hold through the whipsaws and step aside only
+// on a real drawdown (trailing stop) or a hard stop. It trades once per
+// day at most on this window.
 //
 // Entry (flat, on a bar's close, filled at the next open): the trailing
-// LB-bar return is positive (close above the close LB bars ago) AND the
-// fast EMA is above the slow EMA. All-in, one position.
-// Exit (the whole position, on a bar's close): the fast EMA crosses below
-// the slow EMA, OR the position's value falls to the trailing stop
-// (TRAIL of its peak value since entry), OR to the hard stop (STOP of
-// its cost). A sell the market refuses is sent again on the next bar
-// while its reason still holds. No take-profit: winners run.
+// LB-bar return is positive (close above the close LB bars ago).
+// All-in, one position.
+// Exit (the whole position, on a bar's close): the position's value
+// falls to the trailing stop (TRAIL of its peak value since entry), OR
+// to the hard stop (STOP of its cost). A sell the market refuses is
+// sent again on the next bar while its reason still holds. No
+// take-profit: winners run.
 // No network, no clock, no randomness: the same bars always give the
-// same orders (float64 EMAs on + - * / only, exact integer comparisons
-// for the money math).
+// same orders (exact integer comparisons for the money math).
 
 import { BPS, runBars, type Bar, type BarsState, type BuyInput, type SellInput } from './vendor/makefun-bars.ts';
 
 const LB = 24; // entry momentum lookback, bars
-const FAST = 24; // fast EMA span, bars
-const SLOW = 192; // slow EMA span, bars
 const STOP_NUM = 960n; // hard stop: value <= cost * 960/1000 (-4%)
 const STOP_DEN = 1000n;
 const TRAIL_NUM = 975n; // trailing stop: value <= peak * 975/1000 (-2.5%)
 const TRAIL_DEN = 1000n;
 const MAX_SLIPPAGE_BPS = 100;
 
-let fastValue: number | null = null;
-let slowValue: number | null = null;
-const fastWarm: number[] = [];
-const slowWarm: number[] = [];
 const closes: number[] = [];
-let gapPrev: number | null = null; // fast - slow on the previous bar
 let peakValue = 0n;
-
-function emaStep(warm: number[], value: { v: number | null }, span: number, close: number): number | null {
-  if (value.v !== null) {
-    value.v += (2 / (span + 1)) * (close - value.v);
-    return value.v;
-  }
-  warm.push(close);
-  if (warm.length === span) value.v = warm.reduce((a, x) => a + x, 0) / span;
-  return value.v;
-}
-
-const fastBox = { v: null as number | null };
-const slowBox = { v: null as number | null };
 
 await runBars({
   onBatch(state: BarsState, batch: { bars: Bar[] }) {
-    let crossDown = false;
     for (const bar of batch.bars) {
-      const c = Number(bar.c);
-      closes.push(c);
-      const f = emaStep(fastWarm, fastBox, FAST, c);
-      const s = emaStep(slowWarm, slowBox, SLOW, c);
-      fastValue = f;
-      slowValue = s;
-      if (f !== null && s !== null) {
-        const gap = f - s;
-        if (gapPrev !== null && gap < 0 && gapPrev >= 0) crossDown = true;
-        gapPrev = gap;
-      }
+      closes.push(Number(bar.c));
     }
     if (state.warmingUp) return [];
     const { caps, fees } = state.hello;
@@ -78,18 +50,17 @@ await runBars({
       if (value > peakValue) peakValue = value;
       const stopHit = value * STOP_DEN <= held.cost * STOP_NUM;
       const trailHit = peakValue > 0n && value * TRAIL_DEN <= peakValue * TRAIL_NUM;
-      if (crossDown || stopHit || trailHit) {
+      if (stopHit || trailHit) {
         orders.push({ side: 'sell', symbol, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS });
         peakValue = 0n;
       }
       return orders;
     }
-    // Flat: enter only on a positive trailing return with fast above slow.
+    // Flat: enter on a positive trailing return.
     if (closes.length <= LB) return [];
     const now = closes[closes.length - 1];
     const then = closes[closes.length - 1 - LB];
     if (!(now > then)) return [];
-    if (fastValue === null || slowValue === null || !(fastValue > slowValue)) return [];
     const slots = Math.min(state.hello.symbols.length, caps.max_open_positions);
     const stake = state.equity / BigInt(slots);
     const byWeight = (BigInt(caps.max_weight_bps) * state.equity) / BPS;
